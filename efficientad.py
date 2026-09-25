@@ -12,7 +12,7 @@ import random
 from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
     ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import recall_score, roc_auc_score
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -37,6 +37,8 @@ def get_argparse():
                         default='./mvtec_loco_anomaly_detection',
                         help='Downloaded Mvtec LOCO dataset')
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
+    parser.add_argument('--recall_threshold', type=float, default=0.5,
+                        help='Anomaly score threshold used to calculate recall')
     return parser.parse_args()
 
 # constants
@@ -230,7 +232,8 @@ def main():
                 autoencoder=autoencoder, teacher_mean=teacher_mean,
                 teacher_std=teacher_std, q_st_start=q_st_start,
                 q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-                test_output_dir=None, desc='Intermediate inference')
+                test_output_dir=None, desc='Intermediate inference',
+                recall_threshold=config.recall_threshold)
             print('Intermediate image auc: {:.4f}'.format(auc))
 
             # teacher frozen
@@ -256,12 +259,13 @@ def main():
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-        test_output_dir=test_output_dir, desc='Final inference')
+        test_output_dir=test_output_dir, desc='Final inference',
+        recall_threshold=config.recall_threshold)
     print('Final image auc: {:.4f}'.format(auc))
 
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
-         desc='Running inference'):
+         desc='Running inference', recall_threshold=0.5):
     y_true = []
     y_score = []
     for image, target, path in tqdm(test_set, desc=desc):
@@ -294,6 +298,10 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
         y_true.append(y_true_image)
         y_score.append(y_score_image)
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
+    y_pred = [int(score >= recall_threshold) for score in y_score]
+    recall = recall_score(y_true=y_true, y_pred=y_pred, zero_division=0)
+    print('Image recall at threshold {:.4f}: {:.4f}'.format(
+        recall_threshold, recall))
     return auc * 100
 
 @torch.no_grad()
