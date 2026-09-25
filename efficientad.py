@@ -3,6 +3,7 @@
 import numpy as np
 import tifffile
 import torch
+import csv
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import argparse
@@ -12,7 +13,7 @@ import random
 from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
     ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
-from sklearn.metrics import recall_score, roc_auc_score
+from sklearn.metrics import confusion_matrix, recall_score, roc_auc_score
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -268,6 +269,7 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          desc='Running inference', recall_threshold=0.5):
     y_true = []
     y_score = []
+    image_results = []
     for image, target, path in tqdm(test_set, desc=desc):
         orig_width = image.width
         orig_height = image.height
@@ -295,13 +297,33 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
 
         y_true_image = 0 if defect_class == 'good' else 1
         y_score_image = np.max(map_combined)
+        y_pred_image = int(y_score_image >= recall_threshold)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
+        image_results.append({
+            'path': path,
+            'true_label': y_true_image,
+            'anomaly_score': y_score_image,
+            'predicted_label': y_pred_image,
+            'result': 'correct' if y_true_image == y_pred_image else 'wrong'
+        })
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
-    y_pred = [int(score >= recall_threshold) for score in y_score]
+    y_pred = [result['predicted_label'] for result in image_results]
     recall = recall_score(y_true=y_true, y_pred=y_pred, zero_division=0)
+    true_negative, false_positive, false_negative, true_positive = \
+        confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    if test_output_dir is not None:
+        report_file = os.path.join(os.path.dirname(test_output_dir),
+                                   'image_scores.csv')
+        with open(report_file, 'w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=image_results[0].keys())
+            writer.writeheader()
+            writer.writerows(image_results)
+        print('Per-image report: {}'.format(report_file))
     print('Image recall at threshold {:.4f}: {:.4f}'.format(
         recall_threshold, recall))
+    print('Confusion matrix: TN={} FP={} FN={} TP={}'.format(
+        true_negative, false_positive, false_negative, true_positive))
     return auc * 100
 
 @torch.no_grad()
