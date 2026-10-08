@@ -40,6 +40,9 @@ def get_argparse():
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
     parser.add_argument('--recall_threshold', type=float, default=0.5,
                         help='Anomaly score threshold used to calculate recall')
+    parser.add_argument('--auto_threshold', action='store_true',
+                        help='Ignore --recall_threshold and use the highest ' +
+                             'threshold that keeps recall at 100%%')
     return parser.parse_args()
 
 # constants
@@ -234,7 +237,8 @@ def main():
                 teacher_std=teacher_std, q_st_start=q_st_start,
                 q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end,
                 test_output_dir=None, desc='Intermediate inference',
-                recall_threshold=config.recall_threshold)
+                recall_threshold=config.recall_threshold,
+                auto_threshold=config.auto_threshold)
             print('Intermediate image auc: {:.4f}'.format(auc))
 
             # teacher frozen
@@ -261,12 +265,13 @@ def main():
         teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference',
-        recall_threshold=config.recall_threshold)
+        recall_threshold=config.recall_threshold,
+        auto_threshold=config.auto_threshold)
     print('Final image auc: {:.4f}'.format(auc))
 
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
-         desc='Running inference', recall_threshold=0.5):
+         desc='Running inference', recall_threshold=0.5, auto_threshold=False):
     y_true = []
     y_score = []
     image_results = []
@@ -297,17 +302,36 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
 
         y_true_image = 0 if defect_class == 'good' else 1
         y_score_image = np.max(map_combined)
-        y_pred_image = int(y_score_image >= recall_threshold)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
         image_results.append({
             'path': path,
             'true_label': y_true_image,
             'anomaly_score': y_score_image,
-            'predicted_label': y_pred_image,
-            'result': 'correct' if y_true_image == y_pred_image else 'wrong'
         })
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
+    if auto_threshold:
+        # highest threshold that still catches every defect (recall = 100%),
+        # which gives the fewest possible false alarms for that recall
+        recall_threshold = min(s for t, s in zip(y_true, y_score) if t == 1)
+        print('Auto threshold for 100% recall: {:.4f}'.format(
+            recall_threshold))
+    defect_scores = sorted(s for t, s in zip(y_true, y_score) if t == 1)
+    good_scores = np.array([s for t, s in zip(y_true, y_score) if t == 0])
+    print('False alarms at target recall:')
+    for target in (1.0, 0.99, 0.98, 0.95, 0.90):
+        # highest threshold that still catches at least `target` of defects
+        n_missed = int(np.floor((1 - target) * len(defect_scores) + 1e-9))
+        thr = defect_scores[n_missed]
+        fp = int(np.sum(good_scores >= thr))
+        print('  recall >= {:.0%}: threshold={:.4f} false_alarms={}/{} '
+              '({:.1%})'.format(target, thr, fp, len(good_scores),
+                                fp / max(1, len(good_scores))))
+    for result in image_results:
+        result['predicted_label'] = int(
+            result['anomaly_score'] >= recall_threshold)
+        result['result'] = 'correct' if \
+            result['true_label'] == result['predicted_label'] else 'wrong'
     y_pred = [result['predicted_label'] for result in image_results]
     recall = recall_score(y_true=y_true, y_pred=y_pred, zero_division=0)
     true_negative, false_positive, false_negative, true_positive = \
