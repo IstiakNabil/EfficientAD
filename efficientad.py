@@ -44,11 +44,13 @@ def get_argparse():
                         help='Anomaly score threshold used to calculate recall')
     parser.add_argument('--threshold_mode', default='best_f1',
                         choices=['fixed', 'best_f1', 'best_accuracy',
-                                 'full_recall'],
+                                 'max_recall', 'full_recall'],
                         help='fixed: use --recall_threshold. best_f1 / ' +
                              'best_accuracy: threshold with the best score ' +
                              'on the test set. full_recall: highest ' +
                              'threshold that keeps recall at 100%%')
+    parser.add_argument('--min_accuracy', type=float, default=0.0,
+                        help='Accuracy floor for --threshold_mode max_recall')
     parser.add_argument('--auto_threshold', action='store_true',
                         help='Shortcut for --threshold_mode full_recall')
     parser.add_argument('--score_mode', default='max',
@@ -265,7 +267,8 @@ def main():
                 test_output_dir=None, desc='Intermediate inference',
                 recall_threshold=config.recall_threshold,
                 threshold_mode=threshold_mode,
-                score_mode=config.score_mode)
+                score_mode=config.score_mode,
+                min_accuracy=config.min_accuracy)
             print('Intermediate image auc: {:.4f}'.format(auc))
 
             # teacher frozen
@@ -294,7 +297,8 @@ def main():
         test_output_dir=test_output_dir, desc='Final inference',
         recall_threshold=config.recall_threshold,
         threshold_mode=threshold_mode,
-        score_mode=config.score_mode)
+        score_mode=config.score_mode,
+        min_accuracy=config.min_accuracy)
     print('Final image auc: {:.4f}'.format(auc))
 
 SCORE_MODES = ('max', 'topk', 'smooth')
@@ -311,20 +315,55 @@ def image_score_variants(anomaly_map):
             'topk': float(np.partition(flat, -k)[-k:].mean()),
             'smooth': float(smoothed.max())}
 
-def best_threshold(y_true, y_score, metric):
-    # threshold with the best F1 ('f1') or accuracy ('acc') on these scores
+def best_threshold(y_true, y_score, metric, min_accuracy=0.0):
+    # threshold with the best F1 ('f1'), accuracy ('acc') or recall ('recall')
+    # on these scores. For 'recall', only thresholds with accuracy of at
+    # least min_accuracy are considered.
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score)
-    best_thr, best_value = None, -1.0
+    best_thr, best_key = None, None
     for thr in np.unique(y_score):
         y_pred = y_score >= thr
+        accuracy = float(np.mean(y_pred == y_true))
         if metric == 'f1':
-            value = f1_score(y_true, y_pred, zero_division=0)
+            key = (f1_score(y_true, y_pred, zero_division=0),)
+        elif metric == 'acc':
+            key = (accuracy,)
         else:
-            value = float(np.mean(y_pred == y_true))
-        if value > best_value:
-            best_thr, best_value = float(thr), value
+            if accuracy < min_accuracy:
+                continue
+            key = (recall_score(y_true, y_pred, zero_division=0), accuracy)
+        if best_key is None or key > best_key:
+            best_thr, best_key = float(thr), key
+    if best_thr is None:
+        raise ValueError('No threshold reaches accuracy {:.4f}'.format(
+            min_accuracy))
     return best_thr
+
+def print_threshold_table(y_true, y_score, chosen):
+    # results at thresholds placed at percentiles of the good images' scores,
+    # plus the chosen one, so the effect of the threshold is visible
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    good_scores = y_score[y_true == 0]
+    thresholds = {float(chosen)}
+    for q in (50, 70, 80, 90, 95, 97, 99):
+        thresholds.add(float(np.percentile(good_scores, q)))
+    print('Results at different thresholds (* = chosen):')
+    print('  {:>9s} {:>8s} {:>7s} {:>11s} {:>9s} {:>6s} {:>6s} {:>6s} {:>6s}'
+          .format('threshold', 'accuracy', 'recall', 'specificity',
+                  'precision', 'TN', 'FP', 'FN', 'TP'))
+    for thr in sorted(thresholds):
+        y_pred = y_score >= thr
+        tp = int(np.sum(y_pred & (y_true == 1)))
+        fp = int(np.sum(y_pred & (y_true == 0)))
+        fn = int(np.sum(~y_pred & (y_true == 1)))
+        tn = int(np.sum(~y_pred & (y_true == 0)))
+        print('{} {:9.4f} {:8.4f} {:7.4f} {:11.4f} {:9.4f} {:6d} {:6d} {:6d} '
+              '{:6d}'.format(
+                  '*' if thr == float(chosen) else ' ', thr,
+                  (tp + tn) / len(y_true), tp / max(1, tp + fn),
+                  tn / max(1, tn + fp), tp / max(1, tp + fp), tn, fp, fn, tp))
 
 def false_alarms_at_recall(y_true, y_score, target):
     defect_scores = sorted(s for t, s in zip(y_true, y_score) if t == 1)
@@ -337,7 +376,7 @@ def false_alarms_at_recall(y_true, y_score, target):
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
          desc='Running inference', recall_threshold=0.5,
-         threshold_mode='fixed', score_mode='max'):
+         threshold_mode='fixed', score_mode='max', min_accuracy=0.0):
     y_true = []
     y_score = []
     score_variants = {mode: [] for mode in SCORE_MODES}
@@ -383,9 +422,12 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
     if threshold_mode == 'full_recall':
         # highest threshold that still catches every defect (recall = 100%)
         recall_threshold = min(s for t, s in zip(y_true, y_score) if t == 1)
-    elif threshold_mode in ('best_f1', 'best_accuracy'):
+    elif threshold_mode in ('best_f1', 'best_accuracy', 'max_recall'):
         recall_threshold = best_threshold(
-            y_true, y_score, 'f1' if threshold_mode == 'best_f1' else 'acc')
+            y_true, y_score,
+            {'best_f1': 'f1', 'best_accuracy': 'acc',
+             'max_recall': 'recall'}[threshold_mode],
+            min_accuracy=min_accuracy)
     print('Threshold mode {}: {:.4f}{}'.format(
         threshold_mode, recall_threshold,
         '' if threshold_mode == 'fixed' else ' (chosen on the test set)'))
@@ -430,6 +472,7 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
         f1_score(y_true, y_pred, zero_division=0)))
     print('Confusion matrix: TN={} FP={} FN={} TP={}'.format(
         true_negative, false_positive, false_negative, true_positive))
+    print_threshold_table(y_true, y_score, recall_threshold)
     return auc * 100
 
 @torch.no_grad()
