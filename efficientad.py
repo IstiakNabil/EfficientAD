@@ -13,7 +13,9 @@ import random
 from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
     ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
-from sklearn.metrics import confusion_matrix, recall_score, roc_auc_score
+from scipy.ndimage import uniform_filter
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, \
+    precision_score, recall_score, roc_auc_score
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -40,9 +42,35 @@ def get_argparse():
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
     parser.add_argument('--recall_threshold', type=float, default=0.5,
                         help='Anomaly score threshold used to calculate recall')
-    parser.add_argument('--auto_threshold', action='store_true',
-                        help='Ignore --recall_threshold and use the highest ' +
+    parser.add_argument('--threshold_mode', default='best_f1',
+                        choices=['fixed', 'best_f1', 'best_accuracy',
+                                 'max_recall', 'target_recall', 'full_recall'],
+                        help='fixed: use --recall_threshold. best_f1 / ' +
+                             'best_accuracy: threshold with the best score ' +
+                             'on the test set. full_recall: highest ' +
                              'threshold that keeps recall at 100%%')
+    parser.add_argument('--split_eval', action='store_true',
+                        help='Choose the threshold on a random half A of ' +
+                             'the test images and report results on the ' +
+                             'unseen half B')
+    parser.add_argument('--split_seed', type=int, default=42,
+                        help='Random seed for the half split')
+    parser.add_argument('--split_fraction', type=float, default=0.5,
+                        help='Share of test images in half A')
+    parser.add_argument('--target_recall', type=float, default=0.95,
+                        help='Share of bad images to catch for ' +
+                             '--threshold_mode target_recall')
+    parser.add_argument('--min_accuracy', type=float, default=0.0,
+                        help='Accuracy floor for --threshold_mode max_recall')
+    parser.add_argument('--auto_threshold', action='store_true',
+                        help='Shortcut for --threshold_mode full_recall')
+    parser.add_argument('--score_mode', default='max',
+                        choices=['max', 'topk', 'smooth'],
+                        help='How one image score is taken from the heatmap')
+    parser.add_argument('--load_dir', default=None,
+                        help='Trainings folder holding student_final.pth and ' +
+                             'autoencoder_final.pth. Skips training and ' +
+                             'only evaluates')
     return parser.parse_args()
 
 # constants
@@ -72,6 +100,8 @@ def main():
     random.seed(seed)
 
     config = get_argparse()
+    threshold_mode = 'full_recall' if config.auto_threshold \
+        else config.threshold_mode
 
     if config.dataset == 'mvtec_ad':
         dataset_path = config.mvtec_ad_path
@@ -151,6 +181,15 @@ def main():
     state_dict = torch.load(config.weights, map_location='cpu')
     teacher.load_state_dict(state_dict)
     autoencoder = get_autoencoder(out_channels)
+    train_steps = config.train_steps
+    if config.load_dir is not None:
+        student = torch.load(os.path.join(config.load_dir,
+                                          'student_final.pth'),
+                             map_location='cpu', weights_only=False)
+        autoencoder = torch.load(os.path.join(config.load_dir,
+                                              'autoencoder_final.pth'),
+                                 map_location='cpu', weights_only=False)
+        train_steps = 0
 
     # teacher frozen
     teacher.eval()
@@ -169,7 +208,7 @@ def main():
                                  lr=1e-4, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=max(1, int(0.95 * config.train_steps)), gamma=0.1)
-    tqdm_obj = tqdm(range(config.train_steps))
+    tqdm_obj = tqdm(range(train_steps))
     for iteration, (image_st, image_ae), image_penalty in zip(
             tqdm_obj, train_loader_infinite, penalty_loader_infinite):
         if on_gpu:
@@ -238,7 +277,12 @@ def main():
                 q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end,
                 test_output_dir=None, desc='Intermediate inference',
                 recall_threshold=config.recall_threshold,
-                auto_threshold=config.auto_threshold)
+                threshold_mode=threshold_mode,
+                score_mode=config.score_mode,
+                min_accuracy=config.min_accuracy,
+                target_recall=config.target_recall,
+                split_eval=config.split_eval, split_seed=config.split_seed,
+                split_fraction=config.split_fraction)
             print('Intermediate image auc: {:.4f}'.format(auc))
 
             # teacher frozen
@@ -266,14 +310,179 @@ def main():
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference',
         recall_threshold=config.recall_threshold,
-        auto_threshold=config.auto_threshold)
+        threshold_mode=threshold_mode,
+        score_mode=config.score_mode,
+        min_accuracy=config.min_accuracy,
+        target_recall=config.target_recall,
+        split_eval=config.split_eval, split_seed=config.split_seed,
+        split_fraction=config.split_fraction)
     print('Final image auc: {:.4f}'.format(auc))
+
+SCORE_MODES = ('max', 'topk', 'smooth')
+
+def image_score_variants(anomaly_map):
+    # max: single hottest pixel (sensitive to noise)
+    # topk: mean of the hottest 1% of pixels
+    # smooth: hottest pixel after averaging over a local window
+    flat = anomaly_map.ravel()
+    k = max(1, int(0.01 * flat.size))
+    window = max(3, (min(anomaly_map.shape) // 16) | 1)
+    smoothed = uniform_filter(anomaly_map, size=window, mode='nearest')
+    return {'max': float(flat.max()),
+            'topk': float(np.partition(flat, -k)[-k:].mean()),
+            'smooth': float(smoothed.max())}
+
+def best_threshold(y_true, y_score, metric, min_accuracy=0.0):
+    # threshold with the best F1 ('f1'), accuracy ('acc') or recall ('recall')
+    # on these scores. For 'recall', only thresholds with accuracy of at
+    # least min_accuracy are considered.
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    best_thr, best_key = None, None
+    for thr in np.unique(y_score):
+        y_pred = y_score >= thr
+        accuracy = float(np.mean(y_pred == y_true))
+        if metric == 'f1':
+            key = (f1_score(y_true, y_pred, zero_division=0),)
+        elif metric == 'acc':
+            key = (accuracy,)
+        else:
+            if accuracy < min_accuracy:
+                continue
+            key = (recall_score(y_true, y_pred, zero_division=0), accuracy)
+        if best_key is None or key > best_key:
+            best_thr, best_key = float(thr), key
+    if best_thr is None:
+        raise ValueError('No threshold reaches accuracy {:.4f}'.format(
+            min_accuracy))
+    return best_thr
+
+def print_threshold_table(y_true, y_score, chosen):
+    # results at thresholds placed at percentiles of the good images' scores,
+    # plus the chosen one, so the effect of the threshold is visible
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    good_scores = y_score[y_true == 0]
+    thresholds = {float(chosen)}
+    for q in (50, 70, 80, 90, 95, 97, 99):
+        thresholds.add(float(np.percentile(good_scores, q)))
+    print('Results at different thresholds (* = chosen):')
+    print('  {:>9s} {:>8s} {:>7s} {:>11s} {:>9s} {:>6s} {:>6s} {:>6s} {:>6s}'
+          .format('threshold', 'accuracy', 'recall', 'specificity',
+                  'precision', 'TN', 'FP', 'FN', 'TP'))
+    for thr in sorted(thresholds):
+        y_pred = y_score >= thr
+        tp = int(np.sum(y_pred & (y_true == 1)))
+        fp = int(np.sum(y_pred & (y_true == 0)))
+        fn = int(np.sum(~y_pred & (y_true == 1)))
+        tn = int(np.sum(~y_pred & (y_true == 0)))
+        print('{} {:9.4f} {:8.4f} {:7.4f} {:11.4f} {:9.4f} {:6d} {:6d} {:6d} '
+              '{:6d}'.format(
+                  '*' if thr == float(chosen) else ' ', thr,
+                  (tp + tn) / len(y_true), tp / max(1, tp + fn),
+                  tn / max(1, tn + fp), tp / max(1, tp + fp), tn, fp, fn, tp))
+
+def false_alarms_at_recall(y_true, y_score, target):
+    defect_scores = sorted(s for t, s in zip(y_true, y_score) if t == 1)
+    good_scores = np.array([s for t, s in zip(y_true, y_score) if t == 0])
+    # highest threshold that still catches at least `target` of the defects
+    n_missed = int(np.floor((1 - target) * len(defect_scores) + 1e-9))
+    thr = defect_scores[n_missed]
+    return thr, int(np.sum(good_scores >= thr)), len(good_scores)
+
+def select_threshold(threshold_mode, y_true, y_score, fixed_threshold,
+                     min_accuracy, target_recall):
+    if threshold_mode == 'full_recall':
+        # highest threshold that still catches every defect (recall = 100%)
+        return min(s for t, s in zip(y_true, y_score) if t == 1)
+    if threshold_mode == 'target_recall':
+        # highest threshold that still catches at least target_recall of the
+        # defects, which flags the fewest good images for that recall
+        return false_alarms_at_recall(y_true, y_score, target_recall)[0]
+    if threshold_mode in ('best_f1', 'best_accuracy', 'max_recall'):
+        return best_threshold(
+            y_true, y_score,
+            {'best_f1': 'f1', 'best_accuracy': 'acc',
+             'max_recall': 'recall'}[threshold_mode],
+            min_accuracy=min_accuracy)
+    return fixed_threshold
+
+def write_image_report(test_output_dir, image_results):
+    if test_output_dir is None:
+        return
+    report_file = os.path.join(os.path.dirname(test_output_dir),
+                               'image_scores.csv')
+    with open(report_file, 'w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=image_results[0].keys())
+        writer.writeheader()
+        writer.writerows(image_results)
+    print('Per-image report: {}'.format(report_file))
+
+def threshold_metrics(y_true, y_score, threshold):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_score) >= threshold
+    tp = int(np.sum(y_pred & (y_true == 1)))
+    fp = int(np.sum(y_pred & (y_true == 0)))
+    fn = int(np.sum(~y_pred & (y_true == 1)))
+    tn = int(np.sum(~y_pred & (y_true == 0)))
+    return {'accuracy': (tp + tn) / len(y_true),
+            'recall': tp / max(1, tp + fn),
+            'specificity': tn / max(1, tn + fp),
+            'precision': tp / max(1, tp + fp),
+            'f1': 2 * tp / max(1, 2 * tp + fp + fn),
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp}
+
+def split_evaluation(y_true, y_score, image_results, threshold_mode,
+                     fixed_threshold, min_accuracy, target_recall, split_seed,
+                     split_fraction, test_output_dir):
+    # Half A (random, same share of good and bad images) chooses the
+    # threshold. Half B never influences it and is used only for testing.
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    rng = np.random.RandomState(split_seed)
+    in_a = np.zeros(len(y_true), dtype=bool)
+    for label in (0, 1):
+        indices = rng.permutation(np.flatnonzero(y_true == label))
+        in_a[indices[:int(round(split_fraction * len(indices)))]] = True
+    in_b = ~in_a
+    threshold = select_threshold(
+        threshold_mode, y_true[in_a], y_score[in_a], fixed_threshold,
+        min_accuracy, target_recall)
+    for i, result in enumerate(image_results):
+        result['split'] = 'A' if in_a[i] else 'B'
+        result['predicted_label'] = int(y_score[i] >= threshold)
+        result['result'] = 'correct' if \
+            result['true_label'] == result['predicted_label'] else 'wrong'
+    write_image_report(test_output_dir, image_results)
+
+    metrics_a = threshold_metrics(y_true[in_a], y_score[in_a], threshold)
+    metrics_b = threshold_metrics(y_true[in_b], y_score[in_b], threshold)
+    print('Half-split evaluation (threshold mode {}, seed {}):'.format(
+        threshold_mode, split_seed))
+    for name, mask, role in (('A', in_a, 'chooses the threshold'),
+                             ('B', in_b, 'unseen, used only for testing')):
+        print('  Half {}: {} images ({} good, {} bad) - {}'.format(
+            name, int(mask.sum()), int(np.sum(y_true[mask] == 0)),
+            int(np.sum(y_true[mask] == 1)), role))
+    print('Threshold chosen on half A: {:.4f}'.format(threshold))
+    print('  {:12s} {:>14s} {:>16s}'.format('', 'half A (seen)',
+                                            'half B (unseen)'))
+    for key in ('accuracy', 'recall', 'specificity', 'precision', 'f1'):
+        print('  {:12s} {:14.4f} {:16.4f}'.format(
+            key, metrics_a[key], metrics_b[key]))
+    for key in ('TN', 'FP', 'FN', 'TP'):
+        print('  {:12s} {:14d} {:16d}'.format(
+            key, metrics_a[key], metrics_b[key]))
 
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
-         desc='Running inference', recall_threshold=0.5, auto_threshold=False):
+         desc='Running inference', recall_threshold=0.5,
+         threshold_mode='fixed', score_mode='max', min_accuracy=0.0,
+         target_recall=0.95, split_eval=False, split_seed=42,
+         split_fraction=0.5):
     y_true = []
     y_score = []
+    score_variants = {mode: [] for mode in SCORE_MODES}
     image_results = []
     for image, target, path in tqdm(test_set, desc=desc):
         orig_width = image.width
@@ -301,7 +510,10 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
             tifffile.imwrite(file, map_combined)
 
         y_true_image = 0 if defect_class == 'good' else 1
-        y_score_image = np.max(map_combined)
+        variants = image_score_variants(map_combined)
+        for mode in score_variants:
+            score_variants[mode].append(variants[mode])
+        y_score_image = variants[score_mode]
         y_true.append(y_true_image)
         y_score.append(y_score_image)
         image_results.append({
@@ -310,23 +522,30 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
             'anomaly_score': y_score_image,
         })
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
-    if auto_threshold:
-        # highest threshold that still catches every defect (recall = 100%),
-        # which gives the fewest possible false alarms for that recall
-        recall_threshold = min(s for t, s in zip(y_true, y_score) if t == 1)
-        print('Auto threshold for 100% recall: {:.4f}'.format(
-            recall_threshold))
-    defect_scores = sorted(s for t, s in zip(y_true, y_score) if t == 1)
-    good_scores = np.array([s for t, s in zip(y_true, y_score) if t == 0])
-    print('False alarms at target recall:')
+    if split_eval:
+        split_evaluation(y_true, y_score, image_results, threshold_mode,
+                         recall_threshold, min_accuracy, target_recall,
+                         split_seed, split_fraction, test_output_dir)
+        return auc * 100
+    recall_threshold = select_threshold(
+        threshold_mode, y_true, y_score, recall_threshold, min_accuracy,
+        target_recall)
+    print('Threshold mode {}: {:.4f}{}'.format(
+        threshold_mode, recall_threshold,
+        '' if threshold_mode == 'fixed' else ' (chosen on the test set)'))
+    print('False alarms at target recall (score_mode={}):'.format(score_mode))
     for target in (1.0, 0.99, 0.98, 0.95, 0.90):
-        # highest threshold that still catches at least `target` of defects
-        n_missed = int(np.floor((1 - target) * len(defect_scores) + 1e-9))
-        thr = defect_scores[n_missed]
-        fp = int(np.sum(good_scores >= thr))
+        thr, fp, n_good = false_alarms_at_recall(y_true, y_score, target)
         print('  recall >= {:.0%}: threshold={:.4f} false_alarms={}/{} '
-              '({:.1%})'.format(target, thr, fp, len(good_scores),
-                                fp / max(1, len(good_scores))))
+              '({:.1%})'.format(target, thr, fp, n_good, fp / max(1, n_good)))
+    print('Comparison of image score modes (false alarm rate at recall):')
+    for mode, scores in score_variants.items():
+        rates = [false_alarms_at_recall(y_true, scores, target)
+                 for target in (1.0, 0.99, 0.95, 0.90)]
+        print('  {:7s} auc={:.2f}  100%: {:.1%}  99%: {:.1%}  95%: {:.1%}  '
+              '90%: {:.1%}'.format(
+                  mode, 100 * roc_auc_score(y_true, scores),
+                  *[fp / max(1, n_good) for _, fp, n_good in rates]))
     for result in image_results:
         result['predicted_label'] = int(
             result['anomaly_score'] >= recall_threshold)
@@ -336,18 +555,28 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
     recall = recall_score(y_true=y_true, y_pred=y_pred, zero_division=0)
     true_negative, false_positive, false_negative, true_positive = \
         confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    if test_output_dir is not None:
-        report_file = os.path.join(os.path.dirname(test_output_dir),
-                                   'image_scores.csv')
-        with open(report_file, 'w', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=image_results[0].keys())
-            writer.writeheader()
-            writer.writerows(image_results)
-        print('Per-image report: {}'.format(report_file))
-    print('Image recall at threshold {:.4f}: {:.4f}'.format(
-        recall_threshold, recall))
+    write_image_report(test_output_dir, image_results)
+    if threshold_mode == 'target_recall':
+        n_defects = true_positive + false_negative
+        print('Defect detection at threshold {:.4f}:'.format(recall_threshold))
+        print('  Bad images caught: {}/{} (recall {:.1%})'.format(
+            true_positive, n_defects, recall))
+        print('  Bad images missed: {}'.format(false_negative))
+        print('  Cost: {} good images also flagged as bad'.format(
+            false_positive))
+        return auc * 100
+    print('Results at threshold {:.4f}:'.format(recall_threshold))
+    print('  Accuracy:    {:.4f}'.format(accuracy_score(y_true, y_pred)))
+    print('  Recall:      {:.4f}  (defects caught)'.format(recall))
+    print('  Specificity: {:.4f}  (good images passed)'.format(
+        true_negative / max(1, true_negative + false_positive)))
+    print('  Precision:   {:.4f}'.format(
+        precision_score(y_true, y_pred, zero_division=0)))
+    print('  F1:          {:.4f}'.format(
+        f1_score(y_true, y_pred, zero_division=0)))
     print('Confusion matrix: TN={} FP={} FN={} TP={}'.format(
         true_negative, false_positive, false_negative, true_positive))
+    print_threshold_table(y_true, y_score, recall_threshold)
     return auc * 100
 
 @torch.no_grad()
